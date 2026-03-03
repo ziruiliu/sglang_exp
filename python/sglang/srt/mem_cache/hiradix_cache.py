@@ -11,11 +11,14 @@ from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOper
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -70,8 +73,52 @@ class HiRadixCache(RadixCache):
                 page_size,
                 hicache_mem_layout,
             )
+        elif isinstance(self.kv_cache, HybridLinearKVPool):
+            # For hybrid attention models (e.g., Qwen3.5), handle both KV cache
+            # and Mamba states. Full attention layers use KV cache, while linear
+            # attention (GDN/Mamba) layers use conv+temporal states.
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                self.kv_cache.full_kv_pool,  # Wrap the internal full attention pool
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
+            )
+
+            # Also create MambaPoolHost for linear attention state caching
+            self.mamba_pool_host: Optional[MambaPoolHost] = None
+            if isinstance(req_to_token_pool, HybridReqToTokenPool):
+                mamba_pool = req_to_token_pool.mamba_pool
+                mamba_map = req_to_token_pool.mamba_map  # global_layer_id -> local_idx
+
+                # Get Mamba state shapes from the pool
+                # mamba_cache[0] = conv_state, mamba_cache[1] = temporal_state
+                # Shape: [num_layers, size + 1] + state_shape
+                conv_state_shape = mamba_pool.mamba_cache[0].shape[2:]
+                temporal_state_shape = mamba_pool.mamba_cache[1].shape[2:]
+
+                self.mamba_pool_host = MambaPoolHost(
+                    num_mamba_layers=len(mamba_map),
+                    conv_state_shape=conv_state_shape,
+                    temporal_state_shape=temporal_state_shape,
+                    conv_dtype=mamba_pool.mamba_cache[0].dtype,
+                    ssm_dtype=mamba_pool.mamba_cache[1].dtype,
+                )
+                # Store sorted list of Mamba layer IDs for consistent ordering
+                self.mamba_layer_ids = sorted(mamba_map.keys())
+                logger.info(
+                    f"Initialized MambaPoolHost for hybrid model with {len(mamba_map)} layers"
+                )
+            else:
+                logger.warning(
+                    "HybridLinearKVPool detected but req_to_token_pool is not HybridReqToTokenPool. "
+                    "Mamba state caching will not be available."
+                )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(
+                f"HiRadixCache only supports MHA, MLA, and HybridLinearKVPool, "
+                f"got {type(self.kv_cache).__name__}"
+            )
 
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -84,6 +131,12 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
+
+        # For non-hybrid models, set mamba_pool_host to None
+        if not hasattr(self, 'mamba_pool_host'):
+            self.mamba_pool_host = None
+            self.mamba_layer_ids = []
+
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
@@ -96,6 +149,8 @@ class HiRadixCache(RadixCache):
             prefetch_threshold=self.prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
+            mamba_pool_host=self.mamba_pool_host,
+            mamba_layer_ids=self.mamba_layer_ids,
         )
         if self.enable_storage_metrics:
             # TODO: support pp
@@ -131,6 +186,9 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        # Clear Mamba states for hybrid models
+        if hasattr(self, "mamba_pool_host") and self.mamba_pool_host is not None:
+            self.mamba_pool_host.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -162,7 +220,20 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
-    def write_backup(self, node: TreeNode, write_back=False):
+    def write_backup(
+        self,
+        node: TreeNode,
+        write_back=False,
+        req_mamba_index: Optional[int] = None,
+    ):
+        """
+        Backup KV cache and Mamba states to host memory.
+
+        Args:
+            node: The radix tree node to backup
+            write_back: Whether this is a write-back operation
+            req_mamba_index: The request's Mamba index (for hybrid models)
+        """
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -180,6 +251,22 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
+
+            # For hybrid models, also backup Mamba states
+            if (
+                self.cache_controller.is_hybrid_gdn
+                and req_mamba_index is not None
+                and hasattr(self.req_to_token_pool, "mamba_pool")
+            ):
+                success = self.cache_controller.backup_mamba_states(
+                    node_id=node.id,
+                    req_mamba_index=req_mamba_index,
+                    mamba_pool=self.req_to_token_pool.mamba_pool,
+                )
+                if not success:
+                    logger.warning(
+                        f"Failed to backup Mamba states for node {node.id}"
+                    )
         else:
             return 0
 
@@ -350,8 +437,19 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self,
+        node: TreeNode,
+        mem_quota: Optional[int] = None,
+        req_mamba_index: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
+        """
+        Load KV cache and Mamba states from host to device.
+
+        Args:
+            node: The radix tree node to load
+            mem_quota: Memory quota for loading
+            req_mamba_index: The request's Mamba index (for hybrid models)
+        """
         # todo: more loading policies
 
         last_hit_node = node
@@ -398,6 +496,22 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        # For hybrid models, also load Mamba states from the last matched node
+        if (
+            self.cache_controller.is_hybrid_gdn
+            and req_mamba_index is not None
+            and hasattr(self.req_to_token_pool, "mamba_pool")
+        ):
+            success = self.cache_controller.load_mamba_states(
+                node_id=last_hit_node.id,
+                req_mamba_index=req_mamba_index,
+                mamba_pool=self.req_to_token_pool.mamba_pool,
+            )
+            if not success:
+                logger.warning(
+                    f"Failed to load Mamba states for node {last_hit_node.id}"
+                )
+
         return device_indices
 
     def init_load_back(
@@ -405,10 +519,20 @@ class HiRadixCache(RadixCache):
         last_node: TreeNode,
         host_hit_length: int,
         mem_quota: Optional[int] = None,
+        req_mamba_index: Optional[int] = None,
     ):
+        """
+        Initialize loading of KV cache and Mamba states from host to device.
+
+        Args:
+            last_node: The last matched node in the radix tree
+            host_hit_length: The length of the prefix hit (unused but kept for compatibility)
+            mem_quota: Memory quota for loading
+            req_mamba_index: The request's Mamba index (for hybrid models)
+        """
         _ = host_hit_length  # unused, but kept for compatibility
         if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+            loading_values = self.load_back(last_node, mem_quota, req_mamba_index)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
@@ -421,6 +545,36 @@ class HiRadixCache(RadixCache):
         return (
             torch.empty((0,), dtype=torch.int64, device=self.device),
             last_node,
+        )
+
+    def load_mamba_states_for_node(
+        self,
+        node: TreeNode,
+        req_mamba_index: int,
+    ) -> bool:
+        """
+        Load Mamba states from host to device for a specific node.
+
+        This should be called after the request's Mamba index is allocated,
+        typically after the request is scheduled.
+
+        Args:
+            node: The radix tree node whose Mamba states to load
+            req_mamba_index: The request's Mamba index
+
+        Returns:
+            True if load succeeded, False otherwise
+        """
+        if not self.cache_controller.is_hybrid_gdn:
+            return True  # Not a hybrid model, nothing to do
+
+        if not hasattr(self.req_to_token_pool, "mamba_pool"):
+            return False
+
+        return self.cache_controller.load_mamba_states(
+            node_id=node.id,
+            req_mamba_index=req_mamba_index,
+            mamba_pool=self.req_to_token_pool.mamba_pool,
         )
 
     def ready_to_load_host_cache(self) -> int:

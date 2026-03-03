@@ -345,9 +345,11 @@ class ModelRunner:
                 self.is_hybrid = self.model_config.is_hybrid = True
 
         if self.is_hybrid_gdn:
-            logger.warning("Hybrid GDN model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
+            # Set attention backend for hybrid GDN models
             self.server_args.attention_backend = "hybrid_linear_attn"
+            # Note: Radix cache and HiCache are now supported for hybrid GDN models.
+            # HiCache handles the full attention layers' KV cache, while linear attention
+            # (GDN/Mamba) layers use fixed-size states that stay in GPU memory.
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:
                     self.server_args.max_mamba_cache_size = (

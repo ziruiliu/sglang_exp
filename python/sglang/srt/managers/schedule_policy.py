@@ -573,8 +573,19 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                # For hybrid models with Mamba state caching, get the Mamba index
+                req_mamba_index = None
+                if (
+                    hasattr(self.tree_cache, "cache_controller")
+                    and self.tree_cache.cache_controller.is_hybrid_gdn
+                    and hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping")
+                ):
+                    req_mamba_index = self.req_to_token_pool.rid_to_mamba_index_mapping.get(
+                        req.rid
+                    )
+
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    req.last_host_node, req.host_hit_length, req_mamba_index=req_mamba_index
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)

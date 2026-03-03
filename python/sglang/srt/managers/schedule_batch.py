@@ -685,6 +685,7 @@ class Req:
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
+        req_to_token_pool: Optional["ReqToTokenPool"] = None,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
@@ -698,6 +699,23 @@ class Req:
                     token_ids=self.adjust_max_prefix_ids(), extra_key=self.extra_key
                 ),
             )
+
+            # For hybrid models with Mamba state caching, load Mamba states
+            # if there's a prefix match and the Mamba index is allocated
+            if (
+                self.host_hit_length > 0
+                and req_to_token_pool is not None
+                and hasattr(tree_cache, "load_mamba_states_for_node")
+            ):
+                # Get the Mamba index for this request
+                if hasattr(req_to_token_pool, "rid_to_mamba_index_mapping"):
+                    req_mamba_index = req_to_token_pool.rid_to_mamba_index_mapping.get(
+                        self.rid
+                    )
+                    if req_mamba_index is not None:
+                        tree_cache.load_mamba_states_for_node(
+                            self.last_host_node, req_mamba_index
+                        )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):

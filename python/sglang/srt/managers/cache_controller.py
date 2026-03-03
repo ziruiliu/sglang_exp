@@ -26,7 +26,8 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.memory_pool import MambaPool
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MambaPoolHost
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -38,7 +39,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +256,8 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
+        mamba_pool_host: Optional["MambaPoolHost"] = None,
+        mamba_layer_ids: Optional[List[int]] = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -259,6 +266,11 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+
+        # Mamba state support for hybrid attention models
+        self.mamba_pool_host = mamba_pool_host
+        self.mamba_layer_ids = mamba_layer_ids or []
+        self.is_hybrid_gdn = isinstance(self.mem_pool_device, HybridLinearKVPool)
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -315,9 +327,14 @@ class HiCacheController:
                 self.page_set_func = self._page_set_zero_copy
 
         self.device = self.mem_pool_device.device
-        self.layer_num = self.mem_pool_device.layer_num
+        # For hybrid attention models, use the full attention KV pool for layer operations
+        if isinstance(self.mem_pool_device, HybridLinearKVPool):
+            self._kv_pool_for_hicache = self.mem_pool_device.full_kv_pool
+        else:
+            self._kv_pool_for_hicache = self.mem_pool_device
+        self.layer_num = self._kv_pool_for_hicache.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
-        self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        self._kv_pool_for_hicache.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
             "write_through",
@@ -457,7 +474,7 @@ class HiCacheController:
         with torch.cuda.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+                self._kv_pool_for_hicache, host_indices, device_indices, self.io_backend
             )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
@@ -519,7 +536,7 @@ class HiCacheController:
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
+                    self._kv_pool_for_hicache,
                     host_indices,
                     device_indices,
                     i,
@@ -553,6 +570,54 @@ class HiCacheController:
 
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
+
+    def backup_mamba_states(
+        self,
+        node_id: int,
+        req_mamba_index: int,
+        mamba_pool: "MambaPool",
+    ) -> bool:
+        """
+        Backup Mamba states from device to host memory for a radix tree node.
+
+        Args:
+            node_id: The radix tree node ID
+            req_mamba_index: The request's index in the MambaPool
+            mamba_pool: The device-side MambaPool
+
+        Returns:
+            True if backup succeeded, False otherwise
+        """
+        if self.mamba_pool_host is None:
+            return False
+
+        return self.mamba_pool_host.backup_from_device(
+            mamba_pool, node_id, req_mamba_index, self.mamba_layer_ids
+        )
+
+    def load_mamba_states(
+        self,
+        node_id: int,
+        req_mamba_index: int,
+        mamba_pool: "MambaPool",
+    ) -> bool:
+        """
+        Load Mamba states from host memory to device for a radix tree node.
+
+        Args:
+            node_id: The radix tree node ID
+            req_mamba_index: The request's index in the MambaPool
+            mamba_pool: The device-side MambaPool
+
+        Returns:
+            True if load succeeded, False otherwise
+        """
+        if self.mamba_pool_host is None:
+            return False
+
+        return self.mamba_pool_host.load_to_device(
+            mamba_pool, node_id, req_mamba_index, self.mamba_layer_ids
+        )
 
     def prefetch(
         self,

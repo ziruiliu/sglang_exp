@@ -8,7 +8,14 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
+from typing import Dict, List, Tuple
+
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MambaPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
@@ -754,3 +761,199 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class MambaPoolHost:
+    """
+    Host memory buffer for Mamba (GDN) states.
+
+    Unlike KV cache which is per-token, Mamba states are per-request
+    and represent the cumulative state at a given prefix position.
+
+    For hybrid attention models (e.g., Qwen3.5), each radix tree node
+    stores the Mamba state at the end of that prefix. When a request
+    matches a prefix, the Mamba state is restored to continue from
+    where the prefix left off.
+    """
+
+    def __init__(
+        self,
+        num_mamba_layers: int,
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        max_nodes: int = 10000,
+        device: str = "cpu",
+        pin_memory: bool = True,
+    ):
+        """
+        Initialize Mamba state host buffer.
+
+        Args:
+            num_mamba_layers: Number of linear attention (GDN/Mamba) layers
+            conv_state_shape: Shape of conv state per layer (conv_dim, kernel_size-1)
+            temporal_state_shape: Shape of temporal state per layer (heads, k_dim, v_dim)
+            conv_dtype: Data type for conv state
+            ssm_dtype: Data type for temporal (SSM) state
+            max_nodes: Maximum number of cached nodes in host memory
+            device: Device for host buffer (typically "cpu")
+            pin_memory: Whether to use pinned memory for faster GPU transfers
+        """
+        self.num_mamba_layers = num_mamba_layers
+        self.conv_state_shape = conv_state_shape
+        self.temporal_state_shape = temporal_state_shape
+        self.conv_dtype = conv_dtype
+        self.ssm_dtype = ssm_dtype
+        self.device = device
+        self.pin_memory = pin_memory
+
+        # Calculate sizes
+        self.conv_state_size = num_mamba_layers * conv_state_shape[0] * conv_state_shape[1]
+        self.temporal_state_size = (
+            num_mamba_layers
+            * temporal_state_shape[0]
+            * temporal_state_shape[1]
+            * temporal_state_shape[2]
+        )
+
+        # Pre-allocate buffers for all nodes
+        # Shape: [max_nodes, num_layers] + state_shape
+        conv_buffer_shape = (max_nodes, num_mamba_layers) + conv_state_shape
+        temporal_buffer_shape = (max_nodes, num_mamba_layers) + temporal_state_shape
+
+        self.conv_buffer = torch.zeros(
+            conv_buffer_shape, dtype=conv_dtype, device=device, pin_memory=pin_memory
+        )
+        self.temporal_buffer = torch.zeros(
+            temporal_buffer_shape, dtype=ssm_dtype, device=device, pin_memory=pin_memory
+        )
+
+        # Slot management
+        self._free_slots: List[int] = list(range(max_nodes))
+        self._node_to_slot: Dict[int, int] = {}
+        self.lock = threading.RLock()
+
+        logger.info(
+            f"MambaPoolHost initialized with {max_nodes} nodes. "
+            f"Conv state: {self.conv_state_size} elements, "
+            f"Temporal state: {self.temporal_state_size} elements"
+        )
+
+    def _get_slot(self, node_id: int) -> Optional[int]:
+        """Get the slot for a node, allocating if necessary."""
+        with self.lock:
+            if node_id in self._node_to_slot:
+                return self._node_to_slot[node_id]
+
+            if not self._free_slots:
+                logger.warning("MambaPoolHost out of slots, cannot allocate for node")
+                return None
+
+            slot = self._free_slots.pop(0)
+            self._node_to_slot[node_id] = slot
+            return slot
+
+    def _release_slot(self, node_id: int):
+        """Release the slot for a node."""
+        with self.lock:
+            if node_id in self._node_to_slot:
+                slot = self._node_to_slot.pop(node_id)
+                self._free_slots.append(slot)
+                # Zero out the buffers for security/cleanliness
+                self.conv_buffer[slot] = 0
+                self.temporal_buffer[slot] = 0
+
+    def get_slot(self, node_id: int) -> Optional[int]:
+        """Get the slot for a node (or None if not allocated)."""
+        return self._node_to_slot.get(node_id)
+
+    def backup_from_device(
+        self,
+        mamba_pool: MambaPool,
+        node_id: int,
+        req_mamba_index: int,
+        mamba_layer_ids: List[int],
+    ) -> bool:
+        """
+        Copy Mamba states from device (GPU) to host (CPU).
+
+        Args:
+            mamba_pool: The device-side MambaPool
+            node_id: The radix tree node ID
+            req_mamba_index: The request's index in the MambaPool
+            mamba_layer_ids: List of global layer IDs that use Mamba (sorted)
+
+        Returns:
+            True if backup succeeded, False otherwise
+        """
+        slot = self._get_slot(node_id)
+        if slot is None:
+            return False
+
+        # mamba_pool.mamba_cache[0] = conv_state
+        # mamba_pool.mamba_cache[1] = temporal_state
+        # Shape: [num_layers, req_index + 1, ...]
+        mamba_cache = mamba_pool.mamba_cache
+
+        # Copy states for each Mamba layer
+        for local_idx, global_layer_id in enumerate(mamba_layer_ids):
+            self.conv_buffer[slot, local_idx] = mamba_cache[0][
+                global_layer_id, req_mamba_index
+            ].clone()
+            self.temporal_buffer[slot, local_idx] = mamba_cache[1][
+                global_layer_id, req_mamba_index
+            ].clone()
+
+        return True
+
+    def load_to_device(
+        self,
+        mamba_pool: MambaPool,
+        node_id: int,
+        req_mamba_index: int,
+        mamba_layer_ids: List[int],
+    ) -> bool:
+        """
+        Copy Mamba states from host (CPU) to device (GPU).
+
+        Args:
+            mamba_pool: The device-side MambaPool
+            node_id: The radix tree node ID
+            req_mamba_index: The request's index in the MambaPool
+            mamba_layer_ids: List of global layer IDs that use Mamba (sorted)
+
+        Returns:
+            True if load succeeded, False otherwise
+        """
+        slot = self._node_to_slot.get(node_id)
+        if slot is None:
+            return False
+
+        mamba_cache = mamba_pool.mamba_cache
+
+        # Copy states for each Mamba layer
+        for local_idx, global_layer_id in enumerate(mamba_layer_ids):
+            mamba_cache[0][global_layer_id, req_mamba_index] = self.conv_buffer[
+                slot, local_idx
+            ]
+            mamba_cache[1][global_layer_id, req_mamba_index] = self.temporal_buffer[
+                slot, local_idx
+            ]
+
+        return True
+
+    def get_state_size_bytes(self) -> int:
+        """Get the total size of Mamba state buffers in bytes."""
+        return (
+            self.conv_buffer.element_size() * self.conv_buffer.numel()
+            + self.temporal_buffer.element_size() * self.temporal_buffer.numel()
+        )
+
+    def clear(self):
+        """Clear all cached states."""
+        with self.lock:
+            self._node_to_slot.clear()
+            self._free_slots = list(range(len(self._free_slots)))
+            self.conv_buffer.zero_()
+            self.temporal_buffer.zero_()

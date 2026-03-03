@@ -1437,7 +1437,7 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self.tree_cache, self.req_to_token_pool)
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
@@ -1875,7 +1875,7 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self.tree_cache, self.req_to_token_pool)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
