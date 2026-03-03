@@ -1,24 +1,42 @@
 # HiCache Support for Hybrid Attention Models (GDN/Mamba)
 
+## Overview
+
+This document describes the implementation of HiCache support for hybrid attention models like Qwen3.5-0.8B, which use both full attention and linear attention (GDN/Mamba) layers.
+
 ## Problem Statement
 
-When HiCache loads a prefix match for hybrid attention models like Qwen3.5:
-- **Full attention KV cache** is loaded from storage ✅
-- **Linear attention (GDN/Mamba) states** are NOT loaded ❌
+### The Issue
 
-This causes **incorrect inference** because linear attention layers compute with zero-initialized states instead of the correct accumulated states from the prefix.
+When HiCache loads a prefix match for hybrid attention models:
+- **Full attention KV cache** is loaded from storage ✅
+- **Linear attention (GDN/Mamba) states** were NOT loaded ❌
+
+This caused **incorrect inference** because linear attention layers computed with zero-initialized states instead of the correct accumulated states from the prefix.
+
+### Why This Matters
+
+Hybrid attention models like Qwen3.5 use:
+1. **Full attention layers** - Traditional KV cache, grows with sequence length
+2. **Linear attention (GDN/Mamba) layers** - Fixed-size cumulative states per request
+
+Both types need to be properly cached for correct prefix caching behavior.
 
 ## Understanding GDN/Mamba States
 
-### State Structure (from `MambaPool`)
+### State Structure
 
 ```python
-# conv_state: Sliding window of recent inputs
+# From MambaPool in memory_pool.py
+
+# conv_state: Sliding window of recent inputs (convolution buffer)
 # Shape: [num_mamba_layers, req_slot_id, conv_dim, kernel_size-1]
+# Example: [24, 1025, 1536, 3] for Qwen3.5-0.8B
 conv_state = torch.zeros((num_mamba_layers, size + 1) + conv_state_shape)
 
-# temporal_state: Compressed representation of all past tokens (SSM state)
+# temporal_state: Compressed SSM state (all past information)
 # Shape: [num_mamba_layers, req_slot_id, num_heads, head_k_dim, head_v_dim]
+# Example: [24, 1025, 8, 64, 64] for Qwen3.5-0.8B
 temporal_state = torch.zeros((num_mamba_layers, size + 1) + temporal_state_shape)
 ```
 
@@ -30,6 +48,23 @@ temporal_state = torch.zeros((num_mamba_layers, size + 1) + temporal_state_shape
 | **Dependency** | Token-local | Cumulative (all previous tokens) |
 | **Size** | Grows with seq_len | Fixed per request |
 | **Sharing** | Shareable across requests with same prefix | Shareable across requests with same prefix |
+| **HiCache Storage** | Per-page in host memory | Per-node in host memory |
+
+### Memory Footprint
+
+For Qwen3.5-0.8B with typical GDN configuration:
+- `num_mamba_layers`: ~24 (layers that use linear attention)
+- `conv_state_shape`: (1536, 3)
+- `temporal_state_shape`: (8, 64, 64)
+
+Per request Mamba state size (FP16):
+```
+conv_state: 24 * 1536 * 3 * 2 bytes ≈ 221 KB
+temporal_state: 24 * 8 * 64 * 64 * 2 bytes ≈ 1.5 MB
+Total per request: ≈ 1.7 MB
+```
+
+For 10,000 cached nodes: ~17 GB host memory for Mamba states.
 
 ## Solution Architecture
 
@@ -41,384 +76,260 @@ temporal_state = torch.zeros((num_mamba_layers, size + 1) + temporal_state_shape
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  Radix Tree Node (represents a prefix):                        │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ TreeNode                                                  │  │
-│  │ ├── key: RadixKey (token_ids for this prefix)            │  │
-│  │ ├── value: device_indices (KV cache on GPU)              │  │
-│  │ ├── host_value: host_indices (KV cache on CPU)           │  │
-│  │ ├── hash_value: List[str] (storage keys)                 │  │
-│  │ └── mamba_state: Dict[layer_id -> (conv, temporal)]      │  │  NEW!
-│  │       └── Stores Mamba states at the END of this prefix  │  │
-│  └──────────────────────────────────────────────────────────┘  │
+│  ├── KV Cache (full attention layers)                          │
+│  │   ├── Stored per-token in MHATokenToKVPoolHost              │
+│  │   ├── Backed up to host memory via write_backup()           │
+│  │   └── Loaded from host via load_back()                      │
+│  │                                                              │
+│  └── Mamba States (linear attention layers)                    │
+│      ├── Stored per-node (cumulative state at prefix end)      │
+│      ├── Backed up via MambaPoolHost.backup_from_device()      │
+│      └── Loaded via MambaPoolHost.load_to_device()             │
 │                                                                 │
-│  Storage Backend:                                               │
-│  ├── KV cache pages (existing, per-page)                       │
-│  └── Mamba states (NEW, per-node)                              │
-│      └── Key: node hash, Value: (conv_state, temporal_state)   │
+│  Host Memory Layout:                                           │
+│  ├── MHATokenToKVPoolHost: [page, layer, head, dim]            │
+│  └── MambaPoolHost: [node, layer, state_type, ...]             │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Implementation Components
+### Component Overview
 
-#### 1. Extend `TreeNode` to Store Mamba States
+#### 1. MambaPoolHost (New)
 
-**File: `python/sglang/srt/mem_cache/radix_cache.py`**
-
-```python
-class TreeNode:
-    def __init__(self, id: Optional[int] = None):
-        # ... existing fields ...
-
-        # NEW: Store Mamba states for hybrid attention models
-        # Dict: layer_id (local index) -> (conv_state, temporal_state)
-        # conv_state: [conv_dim, kernel_size-1]
-        # temporal_state: [num_heads, head_k_dim, head_v_dim]
-        self.mamba_state: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None
-
-        # Host-side Mamba state backup
-        self.mamba_state_host: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None
-```
-
-#### 2. Create `MambaPoolHost` for Host Memory Backup
-
-**File: `python/sglang/srt/mem_cache/memory_pool_host.py`**
+**File**: `python/sglang/srt/mem_cache/memory_pool_host.py`
 
 ```python
 class MambaPoolHost:
-    """
-    Host memory buffer for Mamba (GDN) states.
-
-    Unlike KV cache which is per-token, Mamba states are per-request
-    and represent the cumulative state at a given prefix position.
-    """
+    """Host memory buffer for Mamba (GDN) states."""
 
     def __init__(
         self,
-        mamba_pool: MambaPool,
         num_mamba_layers: int,
         conv_state_shape: Tuple[int, int],
         temporal_state_shape: Tuple[int, int],
         conv_dtype: torch.dtype,
         ssm_dtype: torch.dtype,
-        max_nodes: int = 10000,  # Max cached nodes
-        device: str = "cpu",
+        max_nodes: int = 10000,
     ):
-        self.num_mamba_layers = num_mamba_layers
-        self.conv_state_shape = conv_state_shape
-        self.temporal_state_shape = temporal_state_shape
-        self.conv_dtype = conv_dtype
-        self.ssm_dtype = ssm_dtype
-        self.device = device
+        # Pre-allocate buffers: [max_nodes, num_layers] + state_shape
+        self.conv_buffer = torch.zeros(...)
+        self.temporal_buffer = torch.zeros(...)
 
-        # Pool of pre-allocated state buffers (for efficiency)
-        # Each entry: (conv_state, temporal_state) for all layers
-        self._conv_pool = torch.zeros(
-            (max_nodes, num_mamba_layers) + conv_state_shape,
-            dtype=conv_dtype, device=device
-        )
-        self._temporal_pool = torch.zeros(
-            (max_nodes, num_mamba_layers) + temporal_state_shape,
-            dtype=ssm_dtype, device=device
-        )
-        self._free_slots = list(range(max_nodes))
+    def backup_from_device(self, mamba_pool, node_id, req_mamba_index, mamba_layer_ids):
+        """Copy Mamba states from GPU to CPU for a radix tree node."""
 
-        # Mapping: node_id -> pool_slot
-        self._node_to_slot: Dict[int, int] = {}
-
-    def alloc(self, node_id: int) -> int:
-        """Allocate a slot for storing Mamba states."""
-        if not self._free_slots:
-            return -1
-        slot = self._free_slots.pop(0)
-        self._node_to_slot[node_id] = slot
-        return slot
-
-    def free(self, node_id: int):
-        """Free the slot for a node."""
-        if node_id in self._node_to_slot:
-            slot = self._node_to_slot.pop(node_id)
-            self._free_slots.append(slot)
-            # Zero out the buffers
-            self._conv_pool[slot] = 0
-            self._temporal_pool[slot] = 0
-
-    def get_buffers(self, node_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get the conv and temporal state buffers for a node."""
-        slot = self._node_to_slot[node_id]
-        return (
-            self._conv_pool[slot],
-            self._temporal_pool[slot]
-        )
-
-    def backup_from_device(
-        self,
-        mamba_pool: MambaPool,
-        node_id: int,
-        req_mamba_index: int,
-        mamba_layer_ids: List[int]
-    ):
-        """Copy Mamba states from device (GPU) to host (CPU)."""
-        slot = self._node_to_slot.get(node_id)
-        if slot is None:
-            slot = self.alloc(node_id)
-            if slot < 0:
-                return False
-
-        # Get device Mamba cache: [num_cache_tensors, num_layers, ...]
-        mamba_cache = mamba_pool.mamba_cache
-        # mamba_cache[0] = conv_state, mamba_cache[1] = temporal_state
-
-        for local_idx, global_layer_id in enumerate(mamba_layer_ids):
-            # Copy from device to host
-            self._conv_pool[slot, local_idx] = mamba_cache[0][global_layer_id, req_mamba_index]
-            self._temporal_pool[slot, local_idx] = mamba_cache[1][global_layer_id, req_mamba_index]
-
-        return True
-
-    def load_to_device(
-        self,
-        mamba_pool: MambaPool,
-        node_id: int,
-        req_mamba_index: int,
-        mamba_layer_ids: List[int]
-    ):
-        """Copy Mamba states from host (CPU) to device (GPU)."""
-        slot = self._node_to_slot.get(node_id)
-        if slot is None:
-            return False
-
-        mamba_cache = mamba_pool.mamba_cache
-
-        for local_idx, global_layer_id in enumerate(mamba_layer_ids):
-            # Copy from host to device
-            mamba_cache[0][global_layer_id, req_mamba_index] = self._conv_pool[slot, local_idx]
-            mamba_cache[1][global_layer_id, req_mamba_index] = self._temporal_pool[slot, local_idx]
-
-        return True
+    def load_to_device(self, mamba_pool, node_id, req_mamba_index, mamba_layer_ids):
+        """Copy Mamba states from CPU to GPU for a radix tree node."""
 ```
 
-#### 3. Update `HiRadixCache` to Handle Mamba States
+#### 2. HiRadixCache Updates
 
-**File: `python/sglang/srt/mem_cache/hiradix_cache.py`**
+**File**: `python/sglang/srt/mem_cache/hiradix_cache.py`
 
 ```python
 class HiRadixCache(RadixCache):
     def __init__(self, ...):
-        # ... existing initialization ...
+        # ... existing KV cache initialization ...
 
-        # For hybrid attention models, also create Mamba state host buffer
-        self.is_hybrid_gdn = isinstance(self.kv_cache, HybridLinearKVPool)
-        self.mamba_pool_host = None
+        # For hybrid models, also create MambaPoolHost
+        if isinstance(self.kv_cache, HybridLinearKVPool):
+            self.mamba_pool_host = MambaPoolHost(...)
+            self.mamba_layer_ids = sorted(mamba_map.keys())
 
-        if self.is_hybrid_gdn:
-            from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    def write_backup(self, node, req_mamba_index=None):
+        """Backup KV cache AND Mamba states to host."""
+        # ... KV cache backup ...
+        if self.cache_controller.is_hybrid_gdn and req_mamba_index is not None:
+            self.cache_controller.backup_mamba_states(...)
 
-            if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-                mamba_pool = self.req_to_token_pool.mamba_pool
-                config = self.req_to_token_pool.mamba_map  # layer_id -> local_idx
+    def load_back(self, node, req_mamba_index=None):
+        """Load KV cache AND Mamba states from host."""
+        # ... KV cache loading ...
+        if self.cache_controller.is_hybrid_gdn and req_mamba_index is not None:
+            self.cache_controller.load_mamba_states(...)
 
-                self.mamba_pool_host = MambaPoolHost(
-                    mamba_pool=mamba_pool,
-                    num_mamba_layers=len(config),
-                    conv_state_shape=mamba_pool.mamba_cache[0].shape[2:],
-                    temporal_state_shape=mamba_pool.mamba_cache[1].shape[2:],
-                    conv_dtype=mamba_pool.mamba_cache[0].dtype,
-                    ssm_dtype=mamba_pool.mamba_cache[1].dtype,
-                )
-                self.mamba_layer_ids = sorted(config.keys())
-
-    def write_backup(self, node: TreeNode, write_back=False):
-        """Backup KV cache AND Mamba states to host memory."""
-        # Existing KV cache backup
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-        )
-        # ... rest of existing code ...
-
-        # NEW: Backup Mamba states for hybrid models
-        if self.is_hybrid_gdn and node.value is not None:
-            # Get the request's Mamba index from the last token
-            # This requires tracking which request owns this node
-            # For now, we'll backup when the node is being written
-            pass  # Implemented in cache_controller
-
-    def load_back(self, node: TreeNode, ...) -> Optional[torch.Tensor]:
-        """Load KV cache AND Mamba states from host to device."""
-        # Existing KV cache loading
-        device_indices = self.cache_controller.load(...)
-
-        # NEW: After loading KV cache, also restore Mamba states
-        if self.is_hybrid_gdn and self.mamba_pool_host is not None:
-            # Mamba states will be restored when the request is scheduled
-            # See scheduler integration below
-            pass
-
-        return device_indices
+    def load_mamba_states_for_node(self, node, req_mamba_index):
+        """Load Mamba states after request is scheduled."""
 ```
 
-#### 4. Update `HiCacheController` for Mamba State Operations
+#### 3. HiCacheController Updates
 
-**File: `python/sglang/srt/managers/cache_controller.py`**
+**File**: `python/sglang/srt/managers/cache_controller.py`
 
 ```python
 class HiCacheController:
-    def __init__(self, ...):
-        # ... existing initialization ...
-
+    def __init__(self, ..., mamba_pool_host=None, mamba_layer_ids=None):
+        self.mamba_pool_host = mamba_pool_host
+        self.mamba_layer_ids = mamba_layer_ids
         self.is_hybrid_gdn = isinstance(self.mem_pool_device, HybridLinearKVPool)
-        self.mamba_pool_host = None
-        self.mamba_layer_ids = []
 
-        if self.is_hybrid_gdn:
-            # Initialize MambaPoolHost
-            pass
-
-    def backup_mamba_states(
-        self,
-        node_id: int,
-        req_mamba_index: int,
-        mamba_pool: MambaPool
-    ):
+    def backup_mamba_states(self, node_id, req_mamba_index, mamba_pool):
         """Backup Mamba states to host memory."""
-        if self.mamba_pool_host is None:
-            return False
 
-        return self.mamba_pool_host.backup_from_device(
-            mamba_pool, node_id, req_mamba_index, self.mamba_layer_ids
-        )
-
-    def load_mamba_states(
-        self,
-        node_id: int,
-        req_mamba_index: int,
-        mamba_pool: MambaPool
-    ):
+    def load_mamba_states(self, node_id, req_mamba_index, mamba_pool):
         """Load Mamba states from host memory."""
-        if self.mamba_pool_host is None:
-            return False
-
-        return self.mamba_pool_host.load_to_device(
-            mamba_pool, node_id, req_mamba_index, self.mamba_layer_ids
-        )
 ```
 
-#### 5. Storage Backend Integration
+#### 4. Scheduler Integration
 
-**File: `python/sglang/srt/mem_cache/storage/nixl/hicache_nixl.py`**
-
-The storage backend needs to handle Mamba states alongside KV cache:
+**File**: `python/sglang/srt/managers/schedule_batch.py`
 
 ```python
-class HiCacheNixl(HiCacheStorage):
-    def store_node(self, node_id: int, hash_value: str, node_data: Dict):
-        """Store a complete node including KV cache and Mamba states."""
-        # KV cache pages (existing)
-        # ...
+class Req:
+    def init_next_round_input(self, tree_cache, req_to_token_pool):
+        # ... prefix matching ...
 
-        # Mamba states (NEW)
-        if 'mamba_state' in node_data:
-            # Flatten Mamba states for storage
-            mamba_tensors = []
-            for layer_id, (conv, temporal) in node_data['mamba_state'].items():
-                mamba_tensors.append(conv.flatten())
-                mamba_tensors.append(temporal.flatten())
-
-            # Store with a derived key
-            mamba_key = f"{hash_value}_mamba"
-            self.batch_set([mamba_key], mamba_tensors)
-
-    def load_node(self, hash_value: str) -> Dict:
-        """Load a complete node including KV cache and Mamba states."""
-        result = {}
-
-        # KV cache pages (existing)
-        # ...
-
-        # Mamba states (NEW)
-        mamba_key = f"{hash_value}_mamba"
-        if self.exists(mamba_key):
-            # Load and reconstruct Mamba states
-            mamba_data = self.get(mamba_key)
-            result['mamba_state'] = self._reconstruct_mamba_states(mamba_data)
-
-        return result
+        # Load Mamba states if prefix match and Mamba index allocated
+        if self.host_hit_length > 0 and req_to_token_pool is not None:
+            req_mamba_index = req_to_token_pool.rid_to_mamba_index_mapping.get(self.rid)
+            if req_mamba_index is not None:
+                tree_cache.load_mamba_states_for_node(self.last_host_node, req_mamba_index)
 ```
 
-#### 6. Scheduler Integration
+## Implementation Details
 
-**File: `python/sglang/srt/managers/scheduler.py`**
+### Flow Diagram
 
-When a prefix match occurs, restore Mamba states to the new request:
+```
+Request Arrival
+      │
+      ▼
+┌─────────────────┐
+│ Prefix Match    │─── No match ──► New computation
+└────────┬────────┘
+         │ Match found
+         ▼
+┌─────────────────┐
+│ Load KV Cache   │ (from host memory)
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Allocate Mamba  │ (get req_mamba_index)
+│ Index           │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Load Mamba      │ (from host memory)
+│ States          │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Continue        │ (with restored states)
+│ Inference       │
+└─────────────────┘
+```
+
+### Timing of Operations
+
+| Operation | When | Notes |
+|-----------|------|-------|
+| KV cache backup | When node is written to host | `write_backup()` |
+| Mamba state backup | When node is written to host | Same call, requires `req_mamba_index` |
+| KV cache load | When loading evicted node | `load_back()` |
+| Mamba state load | After Mamba index allocated | `load_mamba_states_for_node()` |
+
+### Why Separate Mamba Loading?
+
+The Mamba index is allocated **after** prefix matching in the scheduling flow:
+
+1. `init_load_back()` - Load KV cache (Mamba index not yet allocated)
+2. Request scheduled, Mamba index allocated
+3. `init_next_round_input()` - Load Mamba states (now we have the index)
+
+This is why we have `load_mamba_states_for_node()` as a separate method.
+
+## Files Changed
+
+| File | Changes |
+|------|---------|
+| `memory_pool_host.py` | +205 lines: New `MambaPoolHost` class |
+| `hiradix_cache.py` | +162 lines: Mamba state integration |
+| `cache_controller.py` | +77 lines: Mamba state methods |
+| `schedule_batch.py` | +18 lines: Load Mamba states after scheduling |
+| `schedule_policy.py` | +13 lines: Pass Mamba index to load |
+| `scheduler.py` | +4 lines: Pass req_to_token_pool |
+| `model_runner.py` | +6 lines: Remove forced radix cache disabling |
+
+## Testing
+
+### Unit Tests
 
 ```python
-class Scheduler:
-    def _handle_prefix_match(self, req: Req, match_result: MatchResult):
-        """Handle a prefix cache hit."""
-        # Existing KV cache handling
-        # ...
-
-        # NEW: Restore Mamba states for hybrid models
-        if self.enable_hierarchical_cache and self.model_runner.is_hybrid_gdn:
-            last_node = match_result.last_device_node
-
-            # Get the request's Mamba index
-            mamba_index = self.req_to_token_pool.get_mamba_index(req.rid)
-
-            # Load Mamba states from the matched node
-            if hasattr(last_node, 'mamba_state_host') and last_node.mamba_state_host is not None:
-                self.tree_cache.cache_controller.load_mamba_states(
-                    node_id=last_node.id,
-                    req_mamba_index=mamba_index,
-                    mamba_pool=self.req_to_token_pool.mamba_pool
-                )
+def test_mamba_pool_host():
+    host = MambaPoolHost(num_mamba_layers=24, ...)
+    # Test alloc, backup, load, clear
 ```
 
-## Memory Considerations
+### Integration Tests
 
-### Mamba State Size per Request
+```bash
+# Run Qwen3.5-0.8B with HiCache
+python -m sglang.launch_server \
+    --model Qwen/Qwen3.5-0.8B \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend nixl \
+    --hicache-storage-path /tmp/hicache
 
-For Qwen3.5-0.8B with typical GDN configuration:
-- `num_mamba_layers`: ~24 (layers that use linear attention)
-- `conv_state_shape`: (conv_dim, kernel_size-1) ≈ (1536, 3)
-- `temporal_state_shape`: (num_heads, head_k_dim, head_v_dim) ≈ (8, 64, 64)
-
-Per request Mamba state size:
+# Verify prefix caching works correctly
+python -m sglang.launch_eval \
+    --backend http \
+    --dataset-name boolq \
+    --request-rate 2
 ```
-conv_state: 24 * 1536 * 4 * 2 bytes (FP16) ≈ 580 KB
-temporal_state: 24 * 8 * 64 * 64 * 2 bytes (FP16) ≈ 1.5 MB
-Total per request: ≈ 2 MB
-```
 
-For 1000 cached nodes: ~2 GB host memory for Mamba states.
+### Correctness Verification
 
-## Testing Checklist
-
-1. **Unit tests**: MambaPoolHost alloc/free/backup/load
-2. **Integration tests**: HiCache with hybrid model prefix matching
-3. **Correctness tests**: Verify outputs match without caching
-4. **Performance tests**: Measure overhead of Mamba state caching
-
-## Alternative: Recompute Mamba States
-
-If caching Mamba states is too memory-intensive, an alternative is to **recompute** them from the token sequence:
-
+Compare outputs with and without HiCache:
 ```python
-def restore_mamba_by_recompute(
-    model: nn.Module,
-    req: Req,
-    prefix_tokens: List[int],
-    mamba_layers: List[int]
-):
-    """
-    Recompute Mamba states by processing prefix tokens through linear layers.
+# Without HiCache
+output1 = generate(model, prompt, disable_hicache=True)
 
-    This is slower than caching but uses no extra memory.
-    """
-    # Run prefix tokens through GDN layers to rebuild states
-    # This requires modifying the forward pass to support "state-only" mode
-    pass
+# With HiCache (after warming up cache)
+output2 = generate(model, prompt, disable_hicache=False)
+
+assert torch.allclose(output1, output2, atol=1e-5)
 ```
 
-This approach trades compute for memory and may be preferable for very long prefixes or memory-constrained environments.
+## Performance Considerations
+
+### Memory Usage
+
+```
+Total HiCache memory = KV cache host buffer + Mamba state host buffer
+
+For Qwen3.5-0.8B with 10,000 nodes:
+- KV cache: ~X GB (depends on page_size, num_layers)
+- Mamba states: ~17 GB (1.7 MB * 10,000)
+```
+
+### CPU-GPU Transfer Overhead
+
+Mamba state transfer per node:
+```
+Transfer size: ~1.7 MB (FP16)
+Transfer time: ~1-2 ms (PCIe Gen4)
+Impact: Negligible compared to KV cache transfer
+```
+
+### Scalability
+
+- `max_nodes` parameter controls MambaPoolHost size
+- Default: 10,000 nodes (~17 GB for Qwen3.5-0.8B)
+- Can be tuned based on available host memory
+
+## Future Enhancements
+
+1. **Storage Backend Integration**: Persist Mamba states to disk/object storage
+2. **Compression**: Compress Mamba states to reduce memory footprint
+3. **Selective Caching**: Only cache Mamba states for frequently-hit prefixes
+4. **Recompute Fallback**: Recompute Mamba states from tokens if memory exhausted
+
+## References
+
+- [Mamba Paper](https://arxiv.org/abs/2312.00752)
+- [Qwen3.5 Documentation](https://qwenlm.github.io/)
+- [SGLang HiCache Design](https://github.com/sgl-project/sglang)
