@@ -279,6 +279,23 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
+        # For hybrid models, also store Mamba states to storage backend
+        if (
+            self.cache_controller.is_hybrid_gdn
+            and self.cache_controller.enable_storage
+            and node.hash_value is not None
+        ):
+            # Use the last hash value as the node hash for Mamba state storage
+            node_hash = node.get_last_hash_value()
+            if node_hash is not None:
+                success = self.cache_controller.store_mamba_state_to_backend(
+                    node_hash, node.id
+                )
+                if not success:
+                    logger.warning(
+                        f"Failed to store Mamba state to backend for node {node.id}"
+                    )
+
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
@@ -558,6 +575,8 @@ class HiRadixCache(RadixCache):
         This should be called after the request's Mamba index is allocated,
         typically after the request is scheduled.
 
+        If Mamba states are not in host memory, try to load from storage backend.
+
         Args:
             node: The radix tree node whose Mamba states to load
             req_mamba_index: The request's Mamba index
@@ -571,11 +590,40 @@ class HiRadixCache(RadixCache):
         if not hasattr(self.req_to_token_pool, "mamba_pool"):
             return False
 
-        return self.cache_controller.load_mamba_states(
+        # Try to load from host memory first
+        success = self.cache_controller.load_mamba_states(
             node_id=node.id,
             req_mamba_index=req_mamba_index,
             mamba_pool=self.req_to_token_pool.mamba_pool,
         )
+
+        # If not in host memory and storage is enabled, try loading from storage
+        if not success and self.cache_controller.enable_storage:
+            node_hash = node.get_last_hash_value()
+            if node_hash is not None:
+                # Load from storage to host memory
+                storage_success = (
+                    self.cache_controller.load_mamba_state_from_backend(
+                        node_hash, node.id
+                    )
+                )
+                if storage_success:
+                    # Now load from host to device
+                    success = self.cache_controller.load_mamba_states(
+                        node_id=node.id,
+                        req_mamba_index=req_mamba_index,
+                        mamba_pool=self.req_to_token_pool.mamba_pool,
+                    )
+                else:
+                    logger.warning(
+                        f"Mamba state not found in storage for node {node.id} (hash: {node_hash})"
+                    )
+            else:
+                logger.warning(
+                    f"Cannot load Mamba state: node {node.id} has no hash value"
+                )
+
+        return success
 
     def ready_to_load_host_cache(self) -> int:
         """

@@ -32,6 +32,13 @@ class HiCacheStorageConfig:
     is_page_first_layout: bool
     model_name: Optional[str]
     extra_config: Optional[dict] = None
+    # Mamba state configuration for hybrid attention models
+    is_hybrid_gdn: bool = False
+    num_mamba_layers: int = 0
+    conv_state_shape: Optional[tuple] = None
+    temporal_state_shape: Optional[tuple] = None
+    conv_dtype: Optional[str] = None
+    ssm_dtype: Optional[str] = None
 
 
 @dataclass
@@ -156,6 +163,49 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
+    # Mamba state storage methods for hybrid attention models
+    def store_mamba_state(
+        self,
+        node_hash: str,
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+    ) -> bool:
+        """
+        Store Mamba states for a radix tree node.
+
+        Args:
+            node_hash: The hash key for the node
+            conv_state: Convolution state tensor [num_layers, conv_dim, kernel-1]
+            temporal_state: Temporal (SSM) state tensor [num_layers, heads, k_dim, v_dim]
+
+        Returns:
+            True if successful, False otherwise
+        """
+        raise NotImplementedError("Subclasses should implement this method")
+
+    def load_mamba_state(
+        self,
+        node_hash: str,
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+    ) -> bool:
+        """
+        Load Mamba states for a radix tree node.
+
+        Args:
+            node_hash: The hash key for the node
+            conv_state: Pre-allocated tensor to load conv state into
+            temporal_state: Pre-allocated tensor to load temporal state into
+
+        Returns:
+            True if successful, False otherwise (e.g., state not found)
+        """
+        raise NotImplementedError("Subclasses should implement this method")
+
+    def mamba_state_exists(self, node_hash: str) -> bool:
+        """Check if Mamba state exists for a node."""
+        raise NotImplementedError("Subclasses should implement this method")
+
 
 class HiCacheFile(HiCacheStorage):
 
@@ -263,3 +313,82 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    # Mamba state storage methods for hybrid attention models
+    def store_mamba_state(
+        self,
+        node_hash: str,
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+    ) -> bool:
+        """Store Mamba states for a radix tree node."""
+        if self._mamba_state_exists(node_hash):
+            logger.debug(f"Mamba state {node_hash} already exists. Skipped.")
+            return True
+
+        conv_key = self._get_suffixed_key(f"{node_hash}_conv")
+        temporal_key = self._get_suffixed_key(f"{node_hash}_temporal")
+
+        try:
+            conv_path = os.path.join(self.file_path, f"{conv_key}.bin")
+            temporal_path = os.path.join(self.file_path, f"{temporal_key}.bin")
+
+            conv_state.contiguous().view(dtype=torch.uint8).numpy().tofile(conv_path)
+            temporal_state.contiguous().view(dtype=torch.uint8).numpy().tofile(temporal_path)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save Mamba state {node_hash}: {e}")
+            return False
+
+    def load_mamba_state(
+        self,
+        node_hash: str,
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+    ) -> bool:
+        """Load Mamba states for a radix tree node."""
+        if not self._mamba_state_exists(node_hash):
+            logger.debug(f"Mamba state {node_hash} not found.")
+            return False
+
+        conv_key = self._get_suffixed_key(f"{node_hash}_conv")
+        temporal_key = self._get_suffixed_key(f"{node_hash}_temporal")
+
+        try:
+            conv_path = os.path.join(self.file_path, f"{conv_key}.bin")
+            temporal_path = os.path.join(self.file_path, f"{temporal_key}.bin")
+
+            expected_conv = conv_state.numel() * conv_state.element_size()
+            expected_temporal = temporal_state.numel() * temporal_state.element_size()
+
+            with open(conv_path, "rb", buffering=0) as f:
+                buf = memoryview(conv_state.view(torch.uint8).contiguous().numpy())
+                if f.readinto(buf) != expected_conv:
+                    raise IOError(f"Short read for {conv_key}")
+
+            with open(temporal_path, "rb", buffering=0) as f:
+                buf = memoryview(temporal_state.view(torch.uint8).contiguous().numpy())
+                if f.readinto(buf) != expected_temporal:
+                    raise IOError(f"Short read for {temporal_key}")
+
+            return True
+        except FileNotFoundError:
+            logger.warning(f"Failed to fetch Mamba state {node_hash} from storage.")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load Mamba state {node_hash}: {e}")
+            return False
+
+    def mamba_state_exists(self, node_hash: str) -> bool:
+        """Check if Mamba state exists for a node."""
+        return self._mamba_state_exists(node_hash)
+
+    def _mamba_state_exists(self, node_hash: str) -> bool:
+        """Internal check for Mamba state existence."""
+        conv_key = self._get_suffixed_key(f"{node_hash}_conv")
+        temporal_key = self._get_suffixed_key(f"{node_hash}_temporal")
+
+        conv_path = os.path.join(self.file_path, f"{conv_key}.bin")
+        temporal_path = os.path.join(self.file_path, f"{temporal_key}.bin")
+
+        return os.path.exists(conv_path) and os.path.exists(temporal_path)

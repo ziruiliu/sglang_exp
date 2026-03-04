@@ -393,6 +393,9 @@ class HiCacheController:
         # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
+        # Check for hybrid GDN model
+        is_hybrid_gdn = isinstance(self.mem_pool_device, HybridLinearKVPool)
+
         # Parse extra config JSON if provided
         extra_config = None
         if storage_backend_extra_config:
@@ -407,6 +410,7 @@ class HiCacheController:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
+            is_hybrid_gdn=is_hybrid_gdn,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             extra_config=extra_config,
@@ -618,6 +622,82 @@ class HiCacheController:
         return self.mamba_pool_host.load_to_device(
             mamba_pool, node_id, req_mamba_index, self.mamba_layer_ids
         )
+
+    def store_mamba_state_to_backend(
+        self,
+        node_hash: str,
+        node_id: int,
+    ) -> bool:
+        """
+        Store Mamba states from host memory to storage backend.
+
+        Args:
+            node_hash: The hash key for the node
+            node_id: The radix tree node ID
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.mamba_pool_host is None or not self.enable_storage:
+            return False
+
+        # Get the slot for this node
+        slot = self.mamba_pool_host.get_slot(node_id)
+        if slot is None:
+            logger.warning(f"Mamba state slot not found for node {node_id}")
+            return False
+
+        # Extract Mamba states for all layers
+        conv_state = self.mamba_pool_host.conv_buffer[slot]
+        temporal_state = self.mamba_pool_host.temporal_buffer[slot]
+
+        # Store to backend
+        try:
+            return self.storage_backend.store_mamba_state(
+                node_hash, conv_state, temporal_state
+            )
+        except Exception as e:
+            logger.error(f"Failed to store Mamba state for node {node_id}: {e}")
+            return False
+
+    def load_mamba_state_from_backend(
+        self,
+        node_hash: str,
+        node_id: int,
+    ) -> bool:
+        """
+        Load Mamba states from storage backend to host memory.
+
+        Args:
+            node_hash: The hash key for the node
+            node_id: The radix tree node ID
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.mamba_pool_host is None or not self.enable_storage:
+            return False
+
+        # Allocate a slot for this node
+        slot = self.mamba_pool_host._get_slot(node_id)
+        if slot is None:
+            logger.warning(f"Failed to allocate Mamba state slot for node {node_id}")
+            return False
+
+        # Prepare tensors for loading
+        conv_state = self.mamba_pool_host.conv_buffer[slot]
+        temporal_state = self.mamba_pool_host.temporal_buffer[slot]
+
+        # Load from backend
+        try:
+            return self.storage_backend.load_mamba_state(
+                node_hash, conv_state, temporal_state
+            )
+        except Exception as e:
+            logger.error(f"Failed to load Mamba state for node {node_id}: {e}")
+            # Release the slot on failure
+            self.mamba_pool_host._release_slot(node_id)
+            return False
 
     def prefetch(
         self,

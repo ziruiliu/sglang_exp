@@ -255,3 +255,91 @@ class HiCacheNixl(HiCacheStorage):
             mem_type=self.backend_selector.mem_type,
         )
         return query_res[0] is not None  # can be expanded to multiple keys
+
+    # Mamba state storage methods for hybrid attention models
+    def store_mamba_state(
+        self,
+        node_hash: str,
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+    ) -> bool:
+        """
+        Store Mamba states for a radix tree node.
+
+        Args:
+            node_hash: The hash key for the node
+            conv_state: Convolution state tensor [num_layers, conv_dim, kernel-1]
+            temporal_state: Temporal (SSM) state tensor [num_layers, heads, k_dim, v_dim]
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.mamba_state_exists(node_hash):
+            logger.debug(f"Mamba state {node_hash} already exists. Skipped.")
+            return True
+
+        # Flatten tensors for storage
+        conv_flat = conv_state.contiguous().view(torch.uint8)
+        temporal_flat = temporal_state.contiguous().view(torch.uint8)
+
+        # Create combined Mamba state tensor
+        mamba_data = torch.cat([conv_flat, temporal_flat])
+
+        # Store as a single object/file
+        mamba_key = f"{node_hash}_mamba"
+        return self.set(mamba_key, mamba_data)
+
+    def load_mamba_state(
+        self,
+        node_hash: str,
+        conv_state: torch.Tensor,
+        temporal_state: torch.Tensor,
+    ) -> bool:
+        """
+        Load Mamba states for a radix tree node.
+
+        Args:
+            node_hash: The hash key for the node
+            conv_state: Pre-allocated tensor to load conv state into
+            temporal_state: Pre-allocated tensor to load temporal state into
+
+        Returns:
+            True if successful, False otherwise (e.g., state not found)
+        """
+        if not self.mamba_state_exists(node_hash):
+            logger.debug(f"Mamba state {node_hash} not found.")
+            return False
+
+        mamba_key = f"{node_hash}_mamba"
+
+        # Calculate expected sizes
+        conv_size = conv_state.numel() * conv_state.element_size()
+        temporal_size = temporal_state.numel() * temporal_state.element_size()
+        total_size = conv_size + temporal_size
+
+        # Create a temporary buffer to read the data
+        temp_buffer = torch.empty(total_size, dtype=torch.uint8, device=conv_state.device)
+
+        # Load the combined Mamba state
+        if not self.get(mamba_key, temp_buffer):
+            logger.warning(f"Failed to fetch Mamba state {node_hash} from storage.")
+            return False
+
+        try:
+            # Split the buffer back into conv and temporal states
+            conv_flat = temp_buffer[:conv_size].view_as(conv_state)
+            temporal_flat = temp_buffer[conv_size:].view_as(temporal_state)
+
+            # Copy to the target tensors
+            conv_state.copy_(conv_flat)
+            temporal_state.copy_(temporal_flat)
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load Mamba state {node_hash}: {e}")
+            return False
+
+    def mamba_state_exists(self, node_hash: str) -> bool:
+        """Check if Mamba state exists for a node."""
+        mamba_key = f"{node_hash}_mamba"
+        return self.exists(mamba_key)
