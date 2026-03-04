@@ -143,6 +143,12 @@ class HiRadixCache(RadixCache):
         if self.cache_controller.is_hybrid_gdn and req_mamba_index is not None:
             self.cache_controller.backup_mamba_states(...)
 
+    def write_backup_storage(self, node):
+        """Backup KV cache AND Mamba states to storage."""
+        # ... KV cache storage ...
+        if self.cache_controller.is_hybrid_gdn:
+            self.cache_controller.store_mamba_state_to_backend(...)
+
     def load_back(self, node, req_mamba_index=None):
         """Load KV cache AND Mamba states from host."""
         # ... KV cache loading ...
@@ -185,6 +191,46 @@ class Req:
             req_mamba_index = req_to_token_pool.rid_to_mamba_index_mapping.get(self.rid)
             if req_mamba_index is not None:
                 tree_cache.load_mamba_states_for_node(self.last_host_node, req_mamba_index)
+```
+
+#### 5. Storage Backend Support
+
+**Files**: `python/sglang/srt/mem_cache/hicache_storage.py`, `python/sglang/srt/mem_cache/storage/nixl/hicache_nixl.py`
+
+```python
+# Base storage interface (hicache_storage.py)
+class HiCacheStorage(ABC):
+    def store_mamba_state(self, node_hash, conv_state, temporal_state) -> bool:
+        """Store Mamba states for a radix tree node."""
+        raise NotImplementedError
+
+    def load_mamba_state(self, node_hash, conv_state, temporal_state) -> bool:
+        """Load Mamba states for a radix tree node."""
+        raise NotImplementedError
+
+    def mamba_state_exists(self, node_hash) -> bool:
+        """Check if Mamba state exists for a node."""
+        raise NotImplementedError
+
+# File backend implementation
+class HiCacheFile(HiCacheStorage):
+    def store_mamba_state(self, node_hash, conv_state, temporal_state):
+        # Store as separate files: {hash}_conv.bin, {hash}_temporal.bin
+        ...
+
+    def load_mamba_state(self, node_hash, conv_state, temporal_state):
+        # Load from separate files
+        ...
+
+# NIXL backend implementation
+class HiCacheNixl(HiCacheStorage):
+    def store_mamba_state(self, node_hash, conv_state, temporal_state):
+        # Combine and store as single object: {hash}_mamba
+        ...
+
+    def load_mamba_state(self, node_hash, conv_state, temporal_state):
+        # Load and split combined tensor
+        ...
 ```
 
 ## Implementation Details
