@@ -678,10 +678,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = new_node
 
             if node.evicted:
-                # Unevicted nodes take ownership of the request's KV pages.
-                # Do NOT count them in total_prefix_length, otherwise
-                # cache_finished_req / cache_unfinished_req will free those
-                # pages even though the tree now references them.
                 self._unevict_node(node, value[:prefix_len])
             else:
                 if prev_prefix_len < total_prefix_length + prefix_len:
