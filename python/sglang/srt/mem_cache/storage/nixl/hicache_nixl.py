@@ -87,7 +87,9 @@ class HiCacheNixl(HiCacheStorage):
     ) -> List[tuple[int, int, int, str]]:
         if sizes is None:
             sizes = [0] * len(keys)
-        return [(0, int(size), idx, key) for idx, (key, size) in enumerate(zip(keys, sizes))]
+        return [
+            (0, int(size), idx, key) for idx, (key, size) in enumerate(zip(keys, sizes))
+        ]
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -170,7 +172,9 @@ class HiCacheNixl(HiCacheStorage):
                 return False
             storage_tuples = [(x[0], x[1], x[2]) for x in tuples]
         else:  # mem_type == "FILE"
-            storage_tuples = [(x[0], size, x[2]) for x, size in zip(tuples, transfer_sizes)]
+            storage_tuples = [
+                (x[0], size, x[2]) for x, size in zip(tuples, transfer_sizes)
+            ]
 
         storage_descs = self.agent.get_xfer_descs(
             storage_tuples, self.backend_selector.mem_type
