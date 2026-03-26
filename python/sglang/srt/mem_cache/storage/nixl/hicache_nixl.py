@@ -88,7 +88,8 @@ class HiCacheNixl(HiCacheStorage):
         if sizes is None:
             sizes = [0] * len(keys)
         return [
-            (0, int(size), idx, key) for idx, (key, size) in enumerate(zip(keys, sizes))
+            (0, int(size), uuid.uuid4().int & ((1 << 64) - 1), key)
+            for key, size in zip(keys, sizes)
         ]
 
     def _get_suffixed_key(self, key: str) -> str:
