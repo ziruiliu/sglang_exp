@@ -45,6 +45,11 @@ class NixlRegistry:
         self.agent = agent
         self.mem_type = mem_type
         self.file_manager = file_manager
+        # FILE path-mode registrations can overlap across the async get/set
+        # workers. The POSIX plugin keys a process-wide registration map by
+        # devId, so each overlapping registration needs a disjoint range.
+        self._file_devid_lock = threading.Lock()
+        self._file_devid_next = 1
         # OBJ devIds key a process-wide map in the NIXL OBJ plugin
         # (devIdToObjKey_) that is not protected by a lock, so concurrent
         # OBJ registrations must use disjoint devId ranges. Allocate them
@@ -147,9 +152,15 @@ class NixlRegistry:
                 parts = ["rw", "create"] if direction == "WRITE" else ["ro"]
                 if self.file_manager.use_direct_io:
                     parts.append("direct")
+                n = len(keys)
+                with self._file_devid_lock:
+                    base = self._file_devid_next
+                    self._file_devid_next += n
+                dev_ids = list(range(base, base + n))
                 spec = ",".join(parts)
                 tuples = [
-                    (0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))
+                    (0, sizes[i], dev_ids[i], f"{spec}:{keys[i]}")
+                    for i in range(n)
                 ]
                 with self._registered(tuples, "FILE") as reg:
                     if reg is None:
