@@ -449,6 +449,14 @@ def alloc_with_host_register(
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    if registration_granularity_bytes is not None:
+        # Retain the physical IO unit for storage registration as well as CUDA
+        # pinning. Consumers must use the owning tensor, not an arbitrary view.
+        setattr(
+            buffer,
+            "_sglang_host_registration_granularity_bytes",
+            registration_granularity_bytes,
+        )
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
     return buffer

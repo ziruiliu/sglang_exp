@@ -24,6 +24,11 @@ from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
+from .registration import (
+    CUDA_REGISTERED_RANGES_ATTR,
+    REGISTRATION_GRANULARITY_ATTR,
+    plan_registration_ranges,
+)
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config, nixlBind
@@ -133,6 +138,13 @@ class HiCacheNixl(HiCacheStorage):
         self.backend_selector = NixlBackendSelection(plugin, nixlconfig)
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
+
+        params = nixlconfig.get_backend_initparams(self.backend_selector.backend_name)
+        self._segmented_registration = (
+            self.backend_selector.backend_name == "OBJ"
+            and params.get("accelerated", "false").lower() in ("true", "1")
+            and params.get("type", "s3") in ("", "s3")
+        )
 
         self.registry = NixlRegistry(
             self.agent,
@@ -387,9 +399,7 @@ class HiCacheNixl(HiCacheStorage):
                 self.is_zero_copy = False
 
         if self.is_zero_copy:
-            self._pre_register_host(
-                kv.data_ptr(), kv.numel() * kv.element_size(), "kv_buffer"
-            )
+            self._register_host_buffer(kv, "kv_buffer")
         else:
             # One bounce buffer per direction so set/get run lock-free across
             # the prefetch and backup threads. Sized from get_dummy_flat_data_page()
@@ -420,11 +430,7 @@ class HiCacheNixl(HiCacheStorage):
         is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
         if is_zero_copy:
             for i, buf in enumerate(host_pool.get_hybrid_pool_buffer()):
-                self._pre_register_host(
-                    buf.data_ptr(),
-                    buf.numel() * buf.element_size(),
-                    f"{host_pool_name}_buffer_{i}",
-                )
+                self._register_host_buffer(buf, f"{host_pool_name}_buffer_{i}")
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool, is_zero_copy=True
             )
@@ -600,16 +606,46 @@ class HiCacheNixl(HiCacheStorage):
         file-based backend (POSIX/GDS/GDS_MT/3FS). pin_memory is currently
         unused (alloc_mmap does not support it)."""
         buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
-        self._pre_register_host(buf.data_ptr(), buf.numel() * buf.element_size(), kind)
+        self._register_host_buffer(
+            buf, kind, granularity=page_numel * buf.element_size()
+        )
         return buf
 
-    def _pre_register_host(self, base_addr: int, total_size: int, kind: str) -> None:
-        """Register a single DRAM region up-front and remember the handle."""
-        reg_descs = self.agent.get_reg_descs([(base_addr, total_size, 0, "")], "DRAM")
+    def _register_host_buffer(self, buf, kind, *, granularity=None) -> None:
+        if buf.numel() == 0:
+            return
+        self._pre_register_host(
+            buf.data_ptr(),
+            buf.numel() * buf.element_size(),
+            kind,
+            granularity=granularity
+            or getattr(buf, REGISTRATION_GRANULARITY_ATTR, None),
+            cuda_ranges=getattr(buf, CUDA_REGISTERED_RANGES_ATTR, None),
+        )
+
+    def _pre_register_host(
+        self, base_addr, total_size, kind, *, granularity=None, cuda_ranges=None
+    ) -> None:
+        """Register complete IO units; NIXL owns batch rollback and deregistration."""
+        ranges = (
+            plan_registration_ranges(base_addr, total_size, granularity, cuda_ranges)
+            if self._segmented_registration
+            else [(base_addr, total_size)]
+        )
+        reg_descs = self.agent.get_reg_descs(
+            [(ptr, size, 0, "") for ptr, size in ranges], "DRAM"
+        )
         if reg_descs is None:
             raise RuntimeError(f"Failed to build reg descs for host {kind}")
         try:
             self._host_regs.append(self.agent.register_memory(reg_descs))
+            if self._segmented_registration:
+                logger.info(
+                    "HiCacheNixl registered %s bytes=%d segments=%s",
+                    kind,
+                    total_size,
+                    [size for _, size in ranges],
+                )
         except Exception as e:
             raise RuntimeError(f"Failed to pre-register host {kind} with NIXL") from e
 

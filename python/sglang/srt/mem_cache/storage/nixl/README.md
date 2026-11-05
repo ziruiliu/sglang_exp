@@ -60,6 +60,15 @@ Set the top-level `l3_cleaner_enabled` config key to `false` when an external cl
 
 ## Using NIXL as the HiCache Storage Backend
 
+### Generic S3-over-RDMA host registration
+
+With OBJ `accelerated=true` (`type` omitted or `s3`), large physical host buffers
+are registered as multiple ranges, each at most 4 GiB minus 64 KiB. Segment
+boundaries preserve complete KV pages/state components and existing CUDA
+registrations. The final segment may be shorter. Tensor layouts, storage keys,
+IO batching, and `hicache-size`/`hicache-ratio` behavior are unchanged. Unknown
+large-buffer granularity or an indivisible IO unit above the limit is rejected.
+
 ### 1. How Backend Plugin Selection Works
 
 The NIXL backend can support **multiple storage plugins** (e.g., POSIX, GDS, GDS_MT, 3FS, object store, etc).
